@@ -1,10 +1,38 @@
 import json
 import logging
 import os
+import re
+import subprocess
 import tempfile
 
 import undetected_chromedriver as uc
 from utils.logger_config import logger
+
+
+def _detect_chrome_major_version():
+    """
+    Return the major version of the locally installed Chrome, or None if it
+    cannot be determined.
+
+    undetected-chromedriver otherwise downloads the *latest* ChromeDriver, which
+    fails with SessionNotCreatedException when it does not match the installed
+    Chrome (e.g. driver for Chrome 151 vs. an installed Chrome 150).
+    """
+    try:
+        chrome_path = uc.find_chrome_executable()
+        if not chrome_path:
+            return None
+        output = subprocess.check_output(
+            [chrome_path, "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        match = re.search(r"(\d+)\.\d+\.\d+", output)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        return None
+    return None
 
 # Suppress noisy logs
 for _name in (
@@ -35,7 +63,19 @@ class StockbitTokenFetcher:
 
         # Initialize undetected-chromedriver
         # headless=False is important for manual login
-        self.driver = uc.Chrome(options=options, headless=False, use_subprocess=True)
+        # Pin the driver to the installed Chrome major version so uc downloads a
+        # matching ChromeDriver instead of the latest, avoiding
+        # SessionNotCreatedException on version mismatch.
+        chrome_version = _detect_chrome_major_version()
+        if chrome_version is not None:
+            logger.info(f"Detected installed Chrome major version: {chrome_version}")
+
+        self.driver = uc.Chrome(
+            options=options,
+            headless=False,
+            use_subprocess=True,
+            version_main=chrome_version,
+        )
 
         tmp_dir = tempfile.gettempdir()
         self.token_path = os.path.join(tmp_dir, "stockbit_token.tmp")
