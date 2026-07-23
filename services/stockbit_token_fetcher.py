@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -7,6 +8,34 @@ import tempfile
 
 import undetected_chromedriver as uc
 from utils.logger_config import logger
+
+# A JWT is three base64url segments separated by dots; Stockbit access and
+# refresh tokens both start with "eyJ" (base64 of '{"').
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+# Stockbit endpoints that carry the *refresh* token in their Authorization header.
+_REFRESH_ENDPOINT_HINT = "login/refresh"
+
+
+def _decode_jwt_claims(token):
+    """Return the decoded JWT payload dict, or None if it cannot be decoded."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
+
+
+def _jwt_lifetime(token):
+    """Return the token lifetime (exp - iat) in seconds, or -1 if unknown."""
+    claims = _decode_jwt_claims(token) or {}
+    if "exp" in claims and "iat" in claims:
+        try:
+            return int(claims["exp"]) - int(claims["iat"])
+        except (TypeError, ValueError):
+            return -1
+    return -1
 
 
 def _detect_chrome_major_version():
@@ -92,6 +121,7 @@ class StockbitTokenFetcher:
         logs = driver.get_log("performance")
 
         access_token = None
+        refresh_from_network = None
 
         # We look for Network.requestWillBeSent events
         for entry in logs:
@@ -103,17 +133,24 @@ class StockbitTokenFetcher:
                     request = params.get("request", {})
                     url = request.get("url", "")
 
-                    if self.sample_url in url:
-                        headers = request.get("headers", {})
-                        # Headers keys can be case-sensitive or not depending on browser version, usually title-cased or lowercase.
-                        # We check both.
-                        auth_header = headers.get("Authorization") or headers.get(
-                            "authorization"
-                        )
+                    headers = request.get("headers", {})
+                    # Headers keys can be case-sensitive or not depending on browser version, usually title-cased or lowercase.
+                    # We check both.
+                    auth_header = headers.get("Authorization") or headers.get(
+                        "authorization"
+                    )
 
-                        if auth_header and auth_header.startswith("Bearer "):
-                            access_token = auth_header.split(" ", 1)[1]
-                            # Don't break, keep looking for the LATEST token in the logs
+                    if not (auth_header and auth_header.startswith("Bearer ")):
+                        continue
+
+                    bearer = auth_header.split(" ", 1)[1]
+
+                    if self.sample_url in url:
+                        access_token = bearer
+                        # Don't break, keep looking for the LATEST token in the logs
+                    elif _REFRESH_ENDPOINT_HINT in url:
+                        # A call to login/refresh carries the refresh token itself.
+                        refresh_from_network = bearer
             except (KeyError, json.JSONDecodeError):
                 continue
 
@@ -121,7 +158,7 @@ class StockbitTokenFetcher:
             logger.error(
                 "Could not find Bearer token in captured requests. Make sure the page finished loading."
             )
-            return None, None
+            return None, None, None
 
         # Capture the User-Agent used by the browser
         user_agent = driver.execute_script("return navigator.userAgent;")
@@ -129,12 +166,81 @@ class StockbitTokenFetcher:
 
         logger.info("Access token captured.")
 
+        refresh_token = self._extract_refresh_token(driver, access_token, refresh_from_network)
+        if refresh_token:
+            logger.info(
+                f"Refresh token captured (lifetime ~{_jwt_lifetime(refresh_token) // 3600}h)."
+            )
+        else:
+            logger.warning(
+                "No refresh token found in browser storage. The server will not be able "
+                "to renew the token on its own and will need periodic re-bootstrap."
+            )
+
         with open(self.token_path, "w") as f:
             f.write(access_token)
 
         logger.info(f"Tokens written to: {self.token_path}")
 
-        return access_token, user_agent
+        return access_token, refresh_token, user_agent
+
+    def _extract_refresh_token(self, driver, access_token, refresh_from_network=None):
+        """
+        Locate the Stockbit refresh token so the server can renew access tokens
+        without a browser.
+
+        Priority:
+          1. A refresh token seen in a login/refresh request's Authorization header.
+          2. A JWT persisted in localStorage/cookies that is not the access token.
+             The refresh token outlives the 24h access token, so among candidates
+             we pick the one with the longest lifetime.
+        """
+        if refresh_from_network and refresh_from_network != access_token:
+            return refresh_from_network
+
+        candidates = {}  # token -> source label
+        try:
+            local_storage = (
+                driver.execute_script(
+                    "var o={};"
+                    "for(var i=0;i<window.localStorage.length;i++)"
+                    "{var k=window.localStorage.key(i);o[k]=window.localStorage.getItem(k);}"
+                    "return o;"
+                )
+                or {}
+            )
+        except Exception:
+            local_storage = {}
+
+        if local_storage:
+            logger.debug(f"localStorage keys: {list(local_storage.keys())}")
+
+        for key, value in local_storage.items():
+            if not isinstance(value, str):
+                continue
+            for match in _JWT_RE.findall(value):
+                candidates.setdefault(match, f"localStorage[{key}]")
+
+        try:
+            cookies = driver.get_cookies()
+        except Exception:
+            cookies = []
+        for cookie in cookies:
+            for match in _JWT_RE.findall(cookie.get("value", "") or ""):
+                candidates.setdefault(match, f"cookie[{cookie.get('name')}]")
+
+        best = None  # (lifetime, token, source)
+        for token, source in candidates.items():
+            if token == access_token:
+                continue
+            lifetime = _jwt_lifetime(token)
+            if best is None or lifetime > best[0]:
+                best = (lifetime, token, source)
+
+        if best is not None:
+            logger.info(f"Refresh token source: {best[2]}")
+            return best[1]
+        return None
 
     def close(self):
         try:

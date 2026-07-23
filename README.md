@@ -85,6 +85,58 @@ https://github.com/user-attachments/assets/13395cf7-1e3e-4153-8d20-40d4755a4c6d
 The primary configuration options include environment variables set in the `.env` file. Ensure you have authenticated
 and authorized access to Google Drive and possessed a valid username and password for StockBit API access.
 
+## Stockbit authentication (local login + headless server)
+
+Stockbit access tokens are captured through a real browser login and are valid for **24 hours**. To run the analysis on
+a browser-less server, the login is done **once locally** and the server then renews tokens on its own using the
+**refresh token** — no browser required.
+
+### Token files
+
+Three files are stored in `STOCKBIT_TOKEN_DIR` (defaults to the system temp dir):
+
+| File                             | Purpose                                   |
+| -------------------------------- | ----------------------------------------- |
+| `stockbit_token.tmp`             | Access token (24h lifetime)               |
+| `stockbit_refresh_token.tmp`     | Refresh token (renews the access token)   |
+| `stockbit_ua.tmp`                | Browser User-Agent (must match the token) |
+
+Relevant environment variables:
+
+| Variable                          | Default        | Description                                                                                     |
+| --------------------------------- | -------------- | ----------------------------------------------------------------------------------------------- |
+| `STOCKBIT_TOKEN_DIR`              | system temp    | Persistent directory for the token files. Set this on a server where `/tmp` is wiped on reboot. |
+| `STOCKBIT_DISABLE_BROWSER_LOGIN` | *(unset)*      | Set to `1`/`true` on a headless server so the client renews only via refresh token, never Chrome. |
+
+### 1. Bootstrap locally (machine with Chrome)
+
+```bash
+# Set a stable dir so you know where the files land (optional; defaults to temp).
+export STOCKBIT_TOKEN_DIR="$HOME/.idx-fundamental-tokens"
+uv run python main.py --stockbit-login
+```
+
+A Chrome window opens. Log in to Stockbit, wait for the dashboard, then press Enter in the terminal. The command writes
+the three token files and prints their paths.
+
+### 2. Sync the token files to the server
+
+```bash
+rsync -av "$HOME/.idx-fundamental-tokens/" user@your-vps:/var/lib/idx-fundamental/tokens/
+```
+
+### 3. Run on the server (no Chrome)
+
+```bash
+export STOCKBIT_TOKEN_DIR=/var/lib/idx-fundamental/tokens
+export STOCKBIT_DISABLE_BROWSER_LOGIN=1
+uv run python main.py -f -o excel
+```
+
+The server validates the access token on startup; when it expires it silently calls Stockbit's `login/refresh` to get a
+fresh one and rotates the stored refresh token. It only fails — with an actionable message — if the refresh token itself
+expires, at which point you re-run step 1 and re-sync.
+
 ## Contribution Guidelines
 
 Contributions are welcome! Feel free to open issues or submit pull requests. Please follow these guidelines:

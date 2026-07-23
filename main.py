@@ -10,6 +10,7 @@ from db import database
 from providers.idx import IDX
 from providers.stockbit import StockBit
 from schemas.builder import BuilderOutputType
+from services.stockbit_api_client import StockbitApiClient
 from utils.logger_config import logger
 
 load_dotenv()
@@ -31,7 +32,31 @@ def parse_arguments():
         default=BuilderOutputType.SPREADSHEET,
         help="Specify the output format: 'spreadsheet' for Google Spreadsheet, 'excel' for Excel file",
     )
+    parser.add_argument(
+        "--stockbit-login",
+        action="store_true",
+        help="Run the interactive Stockbit browser login to capture access + refresh "
+        "tokens, then exit. Run this locally (needs Chrome) and sync the token files "
+        "to the server.",
+    )
     return parser.parse_args()
+
+
+def stockbit_login():
+    """One-time interactive bootstrap: capture tokens for later browser-free use."""
+    logger.info("Starting Stockbit interactive login (bootstrap)...")
+    client = StockbitApiClient(auto_authenticate=False)
+    if client.bootstrap_login():
+        logger.info("Stockbit login successful. Token files written to:")
+        logger.info(f"  - {client.token_temp_file_path}")
+        logger.info(f"  - {client.refresh_token_temp_file_path}")
+        logger.info(f"  - {client.ua_temp_file_path}")
+        logger.info(
+            "Sync these three files to the server's STOCKBIT_TOKEN_DIR to run "
+            "browser-free there."
+        )
+    else:
+        logger.error("Stockbit login failed. No tokens were captured.")
 
 
 def main():
@@ -39,6 +64,10 @@ def main():
     start_time = time.time()
 
     args = parse_arguments()
+
+    if args.stockbit_login:
+        stockbit_login()
+        return
 
     # Setup database
     database.setup_db(is_drop_table=False)

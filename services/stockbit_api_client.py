@@ -13,13 +13,15 @@ class StockbitApiClient:
     Handles HTTP requests to the Stockbit API, including authentication and retries.
     """
 
-    def __init__(self):
+    def __init__(self, auto_authenticate: bool = True):
         """
         Initializes the StockbitHttpRequest with a URL and optional headers.
         Authenticates with the Stockbit API upon initialization.
 
         Parameters:
-        - headers (dict): Optional headers for the HTTP request.
+        - auto_authenticate (bool): When True (default), validate/renew the token
+          on construction. Set False for the interactive bootstrap so constructing
+          the client does not trigger a login before ``bootstrap_login`` runs.
         """
         self.headers = {
             "Accept": "application/json",
@@ -27,17 +29,32 @@ class StockbitApiClient:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0",
         }
 
+        self.auto_authenticate = auto_authenticate
+
         self.is_authorise = False
 
-        self.token_temp_file_path = os.path.join(
-            tempfile.gettempdir(), "stockbit_token.tmp"
-        )
+        # Where token files live. Defaults to the system temp dir, but on a
+        # server /tmp can be wiped on reboot, so allow a persistent, explicit
+        # location via STOCKBIT_TOKEN_DIR.
+        token_dir = os.environ.get("STOCKBIT_TOKEN_DIR") or tempfile.gettempdir()
+        os.makedirs(token_dir, exist_ok=True)
+        self.token_dir = token_dir
+
+        # On a headless server (no Chrome) the browser login can never succeed.
+        # Setting STOCKBIT_DISABLE_BROWSER_LOGIN makes the client rely purely on
+        # the refresh token and fail with a clear, actionable message instead of
+        # trying (and failing) to launch a browser.
+        self.disable_browser_login = os.environ.get(
+            "STOCKBIT_DISABLE_BROWSER_LOGIN", ""
+        ).strip().lower() in ("1", "true", "yes")
+
+        self.token_temp_file_path = os.path.join(token_dir, "stockbit_token.tmp")
 
         self.refresh_token_temp_file_path = os.path.join(
-            tempfile.gettempdir(), "stockbit_refresh_token.tmp"
+            token_dir, "stockbit_refresh_token.tmp"
         )
 
-        self.ua_temp_file_path = os.path.join(tempfile.gettempdir(), "stockbit_ua.tmp")
+        self.ua_temp_file_path = os.path.join(token_dir, "stockbit_ua.tmp")
 
         self._initialize_token_file()
 
@@ -110,32 +127,62 @@ class StockbitApiClient:
         """
         return self._request(url, "POST", payload)
 
+    def bootstrap_login(self) -> bool:
+        """
+        Run the interactive browser login and persist the access token, refresh
+        token and User-Agent to ``self.token_dir``.
+
+        Intended for the one-time local bootstrap: run this on a machine with
+        Chrome, then sync the resulting token files to the (browser-less) server.
+
+        Returns:
+            bool: True if a token was obtained, False otherwise.
+        """
+        self._login()
+        return self.is_authorise
+
     def _authenticate_stockbit(self):
         """
         Authenticates with the Stockbit API and updates the authorization header.
-        Get refresh token if the token is expired
-        Login if needed
+
+        Prefer the browser-free refresh path whenever a refresh token is
+        available (even on a fresh process); only fall back to an interactive
+        browser login when no refresh token exists.
         """
 
-        if self.is_authorise and not self._is_refresh_token_empty():
+        if not self._is_refresh_token_empty():
             self._refresh_token()
         else:
             self._login()
 
     def _login(self):
         """
-        Login to Stockbit API.
+        Login to Stockbit API via an interactive browser session.
+
+        Requires a machine with Chrome. On headless servers this is disabled via
+        STOCKBIT_DISABLE_BROWSER_LOGIN; there, an expired/invalid refresh token
+        is a hard error that requires re-running the local bootstrap.
         """
+        if self.disable_browser_login:
+            logger.error(
+                "Browser login is disabled (STOCKBIT_DISABLE_BROWSER_LOGIN) and no valid "
+                "refresh token is available. Re-run the local bootstrap "
+                "(`uv run python main.py --stockbit-login`) on a machine with Chrome and "
+                f"sync the token files in {self.token_dir} to this host."
+            )
+            self.is_authorise = False
+            return
+
         self.headers["Authorization"] = None
 
         token = None
-
+        refresh_token = None
         user_agent = None
 
         fetcher = None
         try:
             fetcher = StockbitTokenFetcher()
-            token, user_agent = fetcher.fetch_tokens()
+            token, refresh_token, user_agent = fetcher.fetch_tokens()
         except Exception as e:
             logger.error(f"Failed to fetch tokens via StockbitTokenFetcher: {e}")
         finally:
@@ -153,7 +200,7 @@ class StockbitApiClient:
                 self.headers["User-Agent"] = user_agent
                 logger.info(f"Updated User-Agent to: {user_agent}")
 
-            self._write_token(token, "", user_agent)
+            self._write_token(token, refresh_token or "", user_agent)
             self.is_authorise = True
         else:
             logger.error("Failed to log in via StockbitTokenFetcher.")
@@ -240,7 +287,8 @@ class StockbitApiClient:
                 if token != "":
                     self.headers["Authorization"] = f"Bearer {token}"
 
-                self._request_challenge()
+                if self.auto_authenticate:
+                    self._request_challenge()
         except FileNotFoundError:
             with open(self.token_temp_file_path, "w") as file:
                 file.write("")
